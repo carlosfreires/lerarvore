@@ -1,109 +1,355 @@
+import sys
+import subprocess
+import importlib.util
+import importlib
+import logging
 import os
-from tkinter import Tk, filedialog
+import site
+from pathlib import Path
 
+# ------------------------------------------------------------------------------
+# Configuração de logging
+# ------------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# =========================
-# UI: Seleção de pasta
-# =========================
-def selecionar_pasta():
-    root = Tk()
-    root.withdraw()
-    root.attributes('-topmost', True)
-    pasta = filedialog.askdirectory(title="Selecione a pasta")
-    return pasta
+# ------------------------------------------------------------------------------
+# Bootstrapper de dependências (auto-instalação com self-reboot)
+# ------------------------------------------------------------------------------
+def garantir_dependencias():
+    """
+    Verifica e instala automaticamente as dependências de terceiros necessárias.
+    Utiliza um mecanismo de 'self-reboot' para que o interpretador recarregue
+    os pacotes recém-instalados no sys.path.
+    """
+    dependencias = {
+        'pypdf': 'pypdf'
+    }
+    algo_instalado = False
 
+    for modulo, pacote in dependencias.items():
+        if importlib.util.find_spec(modulo) is None:
+            logger.info(f"Dependência ausente: '{pacote}'. Iniciando instalação...")
+            try:
+                # 1ª tentativa: instalação padrão no diretório do usuário
+                cmd = [sys.executable, "-m", "pip", "install", "--user", pacote]
+                subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                logger.info(f"'{pacote}' instalado com sucesso (--user).")
+                algo_instalado = True
+            except subprocess.CalledProcessError:
+                logger.warning("Instalação padrão falhou. Tentando com --break-system-packages...")
+                try:
+                    cmd_fallback = [
+                        sys.executable, "-m", "pip", "install",
+                        "--user", "--break-system-packages", pacote
+                    ]
+                    subprocess.check_call(cmd_fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    logger.info(f"'{pacote}' instalado com --break-system-packages.")
+                    algo_instalado = True
+                except subprocess.CalledProcessError:
+                    logger.error(f"Não foi possível instalar '{pacote}'. Instale manualmente.")
+                    sys.exit(1)
 
-# =========================
-# Util: Criar pasta de saída
-# =========================
-def criar_pasta_saida():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(base_dir, "output")
-
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    return output_dir
-
-
-# =========================
-# Util: Nome do arquivo final
-# =========================
-def gerar_nome_arquivo(pasta_origem):
-    nome_base = os.path.basename(os.path.normpath(pasta_origem))
-    return f"{nome_base}.md"
-
-
-# =========================
-# Leitura segura de arquivos
-# =========================
-def ler_arquivo(caminho):
+    # Tkinter é dependência de sistema – verificamos apenas se pode ser importado
     try:
-        with open(caminho, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return "[ERRO AO LER ARQUIVO OU BINÁRIO]"
+        import tkinter
+    except ImportError:
+        logger.error("Tkinter não encontrado. Instale-o (ex: sudo apt install python3-tk).")
+        sys.exit(1)
 
+    # Se algo foi instalado, reiniciamos o script para recarregar o ambiente Python
+    if algo_instalado:
+        logger.info("Reiniciando script para carregar novo ambiente (self-reboot)...")
+        importlib.invalidate_caches()
+        user_site = site.getusersitepackages()
+        if user_site not in sys.path:
+            sys.path.append(user_site)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
-# =========================
-# Core: Gerar conteúdo markdown
-# =========================
-def gerar_markdown(pasta):
-    conteudo_final = []
+# Executa o bootstrapper ANTES de qualquer import de terceiros
+garantir_dependencias()
 
-    for root, dirs, files in os.walk(pasta):
-        for file in files:
-            caminho_completo = os.path.join(root, file)
+# ------------------------------------------------------------------------------
+# Imports seguros (agora as dependências estão garantidas)
+# ------------------------------------------------------------------------------
+from tkinter import Tk, filedialog
+import pypdf
 
-            conteudo_final.append(caminho_completo)
-            conteudo_final.append("")
+# ------------------------------------------------------------------------------
+# Classe principal: conversor de árvore de diretórios para Markdown
+# ------------------------------------------------------------------------------
+class CodebaseToMarkdownConverter:
+    """
+    Varre recursivamente um diretório, lê arquivos de texto/código e PDFs,
+    e gera um único arquivo Markdown consolidado para documentação.
+    Ao final, adiciona uma árvore de diretórios completa (estilo `tree`).
+    """
 
-            conteudo = ler_arquivo(caminho_completo)
-            conteudo_final.append(conteudo)
-            conteudo_final.append("\n---\n")
+    # Extensões consideradas textuais (inclui .pdf)
+    EXTENSOES_TEXTO = {
+        '.ts', '.js', '.py', '.html', '.css', '.c', '.cpp', '.h', '.hpp',
+        '.cs', '.r', '.java', '.txt', '.md', '.json', '.xml', '.yaml', '.yml',
+        '.sh', '.bat', '.sql', '.ini', '.env', '.pdf'
+    }
 
-    return "\n".join(conteudo_final)
+    # Pastas que devem ser ignoradas durante a varredura
+    PASTAS_IGNORADAS = {
+        '.git', 'node_modules', 'venv', '.venv', '__pycache__',
+        '.nx', '.vscode', 'dist', 'build', '.idea'
+    }
 
+    # Mapeamento de extensão -> linguagem para realce de sintaxe no Markdown
+    EXTENSAO_PARA_LINGUAGEM = {
+        '.py': 'python', '.js': 'javascript', '.ts': 'typescript',
+        '.html': 'html', '.css': 'css', '.c': 'c', '.cpp': 'cpp',
+        '.cs': 'csharp', '.java': 'java', '.r': 'r', '.json': 'json',
+        '.md': 'markdown', '.sql': 'sql', '.yaml': 'yaml', '.yml': 'yaml',
+        '.sh': 'bash', '.bat': 'batch', '.txt': 'text'
+    }
 
-# =========================
-# Escrita do arquivo final
-# =========================
-def salvar_markdown(output_dir, nome_arquivo, conteudo):
-    caminho_saida = os.path.join(output_dir, nome_arquivo)
+    def __init__(self, output_dir: str = "output"):
+        """
+        Inicializa o conversor.
 
-    with open(caminho_saida, "w", encoding="utf-8") as f:
-        f.write(conteudo)
+        Args:
+            output_dir: Nome do diretório de saída (relativo ao script).
+        """
+        self.diretorio_script = Path(__file__).resolve().parent
+        self.diretorio_saida = self.diretorio_script / output_dir
+        self.diretorio_saida.mkdir(parents=True, exist_ok=True)
 
-    return caminho_saida
+    def obter_pasta_origem(self) -> Path | None:
+        """
+        Determina a pasta alvo, primeiro por argumento de linha de comando,
+        depois via diálogo gráfico (Tkinter) com confirmação interativa para
+        evitar erros de seleção do diretório pai.
 
+        Returns:
+            Caminho absoluto da pasta escolhida ou None se cancelado.
+        """
+        # Se o usuário passou --dir <caminho>, usa esse caminho
+        if len(sys.argv) >= 3 and sys.argv[1] == '--dir':
+            caminho = Path(sys.argv[2]).resolve()
+            if not caminho.is_dir():
+                logger.error(f"O caminho fornecido não é um diretório: {caminho}")
+                sys.exit(1)
+            logger.info(f"📁 Usando diretório via argumento: {caminho}")
+            return caminho
 
-# =========================
-# Pipeline principal
-# =========================
-def main():
-    print("Selecione a pasta...")
+        # Interface gráfica com confirmação
+        while True:
+            try:
+                print("ℹ️  Importante: navegue até **dentro** da pasta desejada e clique em 'Selecionar pasta'.")
+                root = Tk()
+                root.withdraw()
+                root.attributes('-topmost', True)
+                pasta_str = filedialog.askdirectory(title="Selecione a pasta com o código")
+                root.destroy()
+                if not pasta_str:
+                    return None
 
-    pasta = selecionar_pasta()
+                caminho = Path(pasta_str).resolve()
+                print(f"\n📁 Pasta selecionada: {caminho}")
+                confirma = input("✔️  Este é o diretório correto? (S/n): ").strip().lower()
+                if confirma in ('', 's', 'sim', 'y', 'yes'):
+                    return caminho
+                else:
+                    manual = input("📝 Digite o caminho absoluto correto (ou 'cancelar' para sair): ").strip()
+                    if manual.lower() == 'cancelar':
+                        return None
+                    caminho_manual = Path(manual).resolve()
+                    if caminho_manual.is_dir():
+                        return caminho_manual
+                    else:
+                        print("❌ Caminho inválido. Tente novamente.\n")
+            except Exception as e:
+                logger.error(f"Erro ao abrir diálogo gráfico: {e}")
+                logger.info("Use '--dir <caminho>' para especificar a pasta manualmente.")
+                sys.exit(1)
 
-    if not pasta:
-        print("Nenhuma pasta selecionada.")
-        return
+    def ler_arquivo(self, caminho: Path) -> str:
+        """
+        Lê o conteúdo de um arquivo, tratando texto e PDFs.
 
-    print(f"Pasta selecionada: {pasta}")
+        Args:
+            caminho: Caminho do arquivo.
 
-    output_dir = criar_pasta_saida()
-    nome_arquivo = gerar_nome_arquivo(pasta)
+        Returns:
+            Conteúdo textual ou mensagem de erro.
+        """
+        if not caminho.exists():
+            return f"[ARQUIVO NÃO ENCONTRADO: {caminho}]"
 
-    print("Gerando markdown...")
-    conteudo = gerar_markdown(pasta)
+        if caminho.suffix.lower() == '.pdf':
+            return self._ler_pdf(caminho)
 
-    caminho_final = salvar_markdown(output_dir, nome_arquivo, conteudo)
+        # Tenta múltiplas codificações comuns
+        for encoding in ('utf-8', 'latin-1', 'cp1252'):
+            try:
+                with open(caminho, 'r', encoding=encoding) as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+            except PermissionError:
+                return "[PERMISSÃO NEGADA]"
+            except Exception as e:
+                return f"[ERRO AO LER ARQUIVO: {e}]"
 
-    print(f"\nArquivo gerado com sucesso em:\n{caminho_final}")
+        return "[ERRO: Não foi possível decodificar o arquivo]"
 
+    def _ler_pdf(self, caminho: Path) -> str:
+        """
+        Extrai texto de um PDF usando a biblioteca pypdf.
 
-# =========================
-# Execução
-# =========================
+        Args:
+            caminho: Caminho do arquivo PDF.
+
+        Returns:
+            Texto extraído ou mensagem de erro.
+        """
+        try:
+            with open(caminho, 'rb') as f:
+                leitor = pypdf.PdfReader(f)
+                paginas = []
+                for i, pagina in enumerate(leitor.pages):
+                    texto = pagina.extract_text()
+                    if texto:
+                        paginas.append(f"--- Página {i+1} ---\n{texto}")
+            if paginas:
+                return "\n".join(paginas)
+            return "[PDF SEM TEXTO EXTRAÍVEL (possível imagem escaneada)]"
+        except Exception as e:
+            return f"[ERRO AO PROCESSAR PDF: {e}]"
+
+    def obter_linguagem_markdown(self, extensao: str) -> str:
+        """
+        Retorna o identificador de linguagem para blocos de código Markdown.
+
+        Args:
+            extensao: Extensão do arquivo (ex: '.py').
+
+        Returns:
+            String com o nome da linguagem.
+        """
+        return self.EXTENSAO_PARA_LINGUAGEM.get(extensao.lower(), 'text')
+
+    def gerar_arvore(self, diretorio: Path, prefixo: str = "") -> str:
+        """
+        Gera uma representação em árvore (estilo comando tree) do diretório,
+        listando todos os arquivos e diretórios, ignorando pastas excluídas.
+
+        Args:
+            diretorio: Caminho do diretório raiz.
+            prefixo: Prefixo usado na recursão para desenho das linhas.
+
+        Returns:
+            String multilinha formatada corretamente.
+        """
+        linhas = []
+        try:
+            itens = sorted(diretorio.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+        except PermissionError:
+            return f"{prefixo}[PERMISSÃO NEGADA]\n"
+
+        # Filtra pastas ignoradas
+        itens_visiveis = [item for item in itens if not (item.is_dir() and item.name in self.PASTAS_IGNORADAS)]
+
+        total = len(itens_visiveis)
+        for indice, item in enumerate(itens_visiveis):
+            eh_ultimo = (indice == total - 1)
+            conector = "└── " if eh_ultimo else "├── "
+            linhas.append(f"{prefixo}{conector}{item.name}")
+
+            if item.is_dir():
+                novo_prefixo = prefixo + ("    " if eh_ultimo else "│   ")
+                sub_arvore = self.gerar_arvore(item, novo_prefixo)
+                if sub_arvore:
+                    linhas.append(sub_arvore)
+
+        # Corrigido: garante que cada entrada vire uma linha separada
+        return "\n".join(linhas) + ("\n" if linhas else "")
+
+    def executar(self) -> None:
+        """
+        Pipeline principal: seleciona pasta, varre arquivos, gera o Markdown
+        e adiciona a árvore de diretórios no final.
+        """
+        logger.info("🔍 Aguardando seleção da pasta de origem...")
+        pasta_origem = self.obter_pasta_origem()
+        if not pasta_origem:
+            logger.warning("Nenhuma pasta selecionada. Encerrando.")
+            return
+
+        print(f"\n🔎 Iniciando varredura em: {pasta_origem}")
+        logger.info(f"Iniciando varredura em: {pasta_origem}")
+
+        nome_saida = f"{pasta_origem.name}.md"
+        caminho_saida = self.diretorio_saida / nome_saida
+
+        linhas_markdown = [f"# Documentação da Base de Código: `{pasta_origem.name}`\n\n"]
+        arquivos_processados = 0
+
+        # Percorre recursivamente todos os arquivos
+        for item in pasta_origem.rglob('*'):
+            if not item.is_file():
+                continue
+
+            # Ignora arquivos dentro de pastas proibidas
+            if any(pasta in item.parts for pasta in self.PASTAS_IGNORADAS):
+                continue
+
+            extensao = item.suffix.lower()
+            if extensao not in self.EXTENSOES_TEXTO:
+                continue
+
+            relativo = item.relative_to(pasta_origem)
+            linguagem = self.obter_linguagem_markdown(extensao)
+
+            linhas_markdown.append(f"## `/{relativo}`\n")
+
+            if extensao == '.pdf':
+                linhas_markdown.append("**[Documento PDF]**\n")
+                linhas_markdown.append(self.ler_arquivo(item))
+                linhas_markdown.append("\n\n---\n\n")
+            else:
+                linhas_markdown.append(f"```{linguagem}\n")
+                linhas_markdown.append(self.ler_arquivo(item))
+                linhas_markdown.append("\n```\n\n---\n\n")
+
+            arquivos_processados += 1
+
+        # Geração da árvore de diretórios (corrigida)
+        arvore_str = self.gerar_arvore(pasta_origem)
+        linhas_markdown.append("\n## 📂 Estrutura Completa de Arquivos\n\n")
+        linhas_markdown.append("```text\n")
+        linhas_markdown.append(f"{pasta_origem.name}/\n")
+        linhas_markdown.append(arvore_str)
+        linhas_markdown.append("```\n")
+
+        # Escreve o arquivo Markdown consolidado
+        try:
+            with open(caminho_saida, 'w', encoding='utf-8') as f:
+                f.write("".join(linhas_markdown))
+            print(f"\n✅ Sucesso! {arquivos_processados} arquivos indexados.")
+            print(f"📂 Markdown gerado em: {caminho_saida}")
+            logger.info(f"✅ Sucesso! {arquivos_processados} arquivos indexados.")
+            logger.info(f"📂 Markdown gerado em: {caminho_saida}")
+        except Exception as e:
+            logger.error(f"❌ Falha ao escrever o arquivo de saída: {e}")
+            return
+
+        # Exibição elegante da árvore no terminal
+        print(f"\n🌳 Estrutura de diretórios gerada:\n")
+        print(f"{pasta_origem.name}/")
+        print(arvore_str)
+
+# ------------------------------------------------------------------------------
+# Ponto de entrada
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    try:
+        conversor = CodebaseToMarkdownConverter()
+        conversor.executar()
+    except Exception as e:
+        logger.error(f"Erro inesperado: {e}", exc_info=True)
+        sys.exit(1)
