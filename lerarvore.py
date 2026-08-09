@@ -80,17 +80,10 @@ import pypdf
 # ------------------------------------------------------------------------------
 class CodebaseToMarkdownConverter:
     """
-    Varre recursivamente um diretório, lê arquivos de texto/código e PDFs,
+    Varre recursivamente um diretório, lê TODOS os arquivos (texto, PDF e binários),
     e gera um único arquivo Markdown consolidado para documentação.
     Ao final, adiciona uma árvore de diretórios completa (estilo `tree`).
     """
-
-    # Extensões consideradas textuais (inclui .pdf)
-    EXTENSOES_TEXTO = {
-        '.ts', '.js', '.py', '.html', '.css', '.c', '.cpp', '.h', '.hpp',
-        '.cs', '.r', '.java', '.txt', '.md', '.json', '.xml', '.yaml', '.yml',
-        '.sh', '.bat', '.sql', '.ini', '.env', '.pdf'
-    }
 
     # Pastas que devem ser ignoradas durante a varredura
     PASTAS_IGNORADAS = {
@@ -104,7 +97,25 @@ class CodebaseToMarkdownConverter:
         '.html': 'html', '.css': 'css', '.c': 'c', '.cpp': 'cpp',
         '.cs': 'csharp', '.java': 'java', '.r': 'r', '.json': 'json',
         '.md': 'markdown', '.sql': 'sql', '.yaml': 'yaml', '.yml': 'yaml',
-        '.sh': 'bash', '.bat': 'batch', '.txt': 'text'
+        '.sh': 'bash', '.bat': 'batch', '.txt': 'text',
+        '.mts': 'typescript', '.mjs': 'javascript',
+        '.env': 'text', '.gitignore': 'text', '.example': 'text',
+        '.dockerfile': 'dockerfile', '.toml': 'toml', '.ini': 'ini',
+        '.cfg': 'ini', '.conf': 'ini', '.xml': 'xml', '.svg': 'xml',
+        '.rst': 'rst', '.tex': 'latex', '.bib': 'bibtex',
+    }
+
+    # Mapeamento de nome exato do arquivo -> linguagem (para arquivos sem extensão)
+    NOME_PARA_LINGUAGEM = {
+        'dockerfile': 'dockerfile',
+        'makefile': 'makefile',
+        '.gitignore': 'text',
+        '.gitattributes': 'text',
+        '.editorconfig': 'ini',
+        '.env': 'text',
+        '.env.example': 'text',
+        'license': 'text',
+        'readme': 'markdown',
     }
 
     def __init__(self, output_dir: str = "output"):
@@ -127,7 +138,6 @@ class CodebaseToMarkdownConverter:
         Returns:
             Caminho absoluto da pasta escolhida ou None se cancelado.
         """
-        # Se o usuário passou --dir <caminho>, usa esse caminho
         if len(sys.argv) >= 3 and sys.argv[1] == '--dir':
             caminho = Path(sys.argv[2]).resolve()
             if not caminho.is_dir():
@@ -136,7 +146,6 @@ class CodebaseToMarkdownConverter:
             logger.info(f"📁 Usando diretório via argumento: {caminho}")
             return caminho
 
-        # Interface gráfica com confirmação
         while True:
             try:
                 print("ℹ️  Importante: navegue até **dentro** da pasta desejada e clique em 'Selecionar pasta'.")
@@ -170,12 +179,14 @@ class CodebaseToMarkdownConverter:
     def ler_arquivo(self, caminho: Path) -> str:
         """
         Lê o conteúdo de um arquivo, tratando texto e PDFs.
+        Para arquivos que não podem ser decodificados como texto,
+        retorna uma mensagem de conteúdo binário.
 
         Args:
             caminho: Caminho do arquivo.
 
         Returns:
-            Conteúdo textual ou mensagem de erro.
+            Conteúdo textual ou mensagem de erro/binário.
         """
         if not caminho.exists():
             return f"[ARQUIVO NÃO ENCONTRADO: {caminho}]"
@@ -184,7 +195,7 @@ class CodebaseToMarkdownConverter:
             return self._ler_pdf(caminho)
 
         # Tenta múltiplas codificações comuns
-        for encoding in ('utf-8', 'latin-1', 'cp1252'):
+        for encoding in ('utf-8', 'latin-1', 'cp1252', 'iso-8859-15', 'utf-16'):
             try:
                 with open(caminho, 'r', encoding=encoding) as f:
                     return f.read()
@@ -195,7 +206,8 @@ class CodebaseToMarkdownConverter:
             except Exception as e:
                 return f"[ERRO AO LER ARQUIVO: {e}]"
 
-        return "[ERRO: Não foi possível decodificar o arquivo]"
+        # Se nenhuma codificação funcionou, consideramos binário
+        return "[ARQUIVO BINÁRIO – CONTEÚDO NÃO TEXTUAL]"
 
     def _ler_pdf(self, caminho: Path) -> str:
         """
@@ -221,17 +233,32 @@ class CodebaseToMarkdownConverter:
         except Exception as e:
             return f"[ERRO AO PROCESSAR PDF: {e}]"
 
-    def obter_linguagem_markdown(self, extensao: str) -> str:
+    def obter_linguagem_markdown(self, caminho: Path) -> str:
         """
         Retorna o identificador de linguagem para blocos de código Markdown.
+        Primeiro verifica o nome exato do arquivo (para Dockerfile, etc.),
+        depois a extensão.
 
         Args:
-            extensao: Extensão do arquivo (ex: '.py').
+            caminho: Caminho completo do arquivo.
 
         Returns:
             String com o nome da linguagem.
         """
-        return self.EXTENSAO_PARA_LINGUAGEM.get(extensao.lower(), 'text')
+        nome = caminho.name.lower()
+        if nome in self.NOME_PARA_LINGUAGEM:
+            return self.NOME_PARA_LINGUAGEM[nome]
+
+        # Tratamento para dupla extensão (ex: .env.example)
+        if caminho.suffixes:
+            for sufixo in reversed(caminho.suffixes):
+                linguagem = self.EXTENSAO_PARA_LINGUAGEM.get(sufixo.lower())
+                if linguagem:
+                    return linguagem
+
+        # Fallback para a última extensão
+        extensao = caminho.suffix.lower()
+        return self.EXTENSAO_PARA_LINGUAGEM.get(extensao, 'text')
 
     def gerar_arvore(self, diretorio: Path, prefixo: str = "") -> str:
         """
@@ -266,13 +293,12 @@ class CodebaseToMarkdownConverter:
                 if sub_arvore:
                     linhas.append(sub_arvore)
 
-        # Corrigido: garante que cada entrada vire uma linha separada
         return "\n".join(linhas) + ("\n" if linhas else "")
 
     def executar(self) -> None:
         """
-        Pipeline principal: seleciona pasta, varre arquivos, gera o Markdown
-        e adiciona a árvore de diretórios no final.
+        Pipeline principal: seleciona pasta, varre TODOS os arquivos,
+        gera o Markdown e adiciona a árvore de diretórios no final.
         """
         logger.info("🔍 Aguardando seleção da pasta de origem...")
         pasta_origem = self.obter_pasta_origem()
@@ -289,7 +315,7 @@ class CodebaseToMarkdownConverter:
         linhas_markdown = [f"# Documentação da Base de Código: `{pasta_origem.name}`\n\n"]
         arquivos_processados = 0
 
-        # Percorre recursivamente todos os arquivos
+        # Percorre recursivamente todos os arquivos (sem filtro de extensão)
         for item in pasta_origem.rglob('*'):
             if not item.is_file():
                 continue
@@ -298,27 +324,30 @@ class CodebaseToMarkdownConverter:
             if any(pasta in item.parts for pasta in self.PASTAS_IGNORADAS):
                 continue
 
-            extensao = item.suffix.lower()
-            if extensao not in self.EXTENSOES_TEXTO:
-                continue
-
             relativo = item.relative_to(pasta_origem)
-            linguagem = self.obter_linguagem_markdown(extensao)
+            linguagem = self.obter_linguagem_markdown(item)
+            conteudo = self.ler_arquivo(item)
 
+            # Cabeçalho com caminho relativo
             linhas_markdown.append(f"## `/{relativo}`\n")
 
-            if extensao == '.pdf':
+            if item.suffix.lower() == '.pdf':
                 linhas_markdown.append("**[Documento PDF]**\n")
-                linhas_markdown.append(self.ler_arquivo(item))
+                linhas_markdown.append(conteudo)
                 linhas_markdown.append("\n\n---\n\n")
+            elif conteudo.startswith("[ARQUIVO BINÁRIO"):
+                # Arquivo binário: registra a informação mas não tenta exibir conteúdo
+                linhas_markdown.append("**[Arquivo Binário]**\n")
+                linhas_markdown.append(f"*{conteudo}*\n")
+                linhas_markdown.append("\n---\n\n")
             else:
                 linhas_markdown.append(f"```{linguagem}\n")
-                linhas_markdown.append(self.ler_arquivo(item))
+                linhas_markdown.append(conteudo)
                 linhas_markdown.append("\n```\n\n---\n\n")
 
             arquivos_processados += 1
 
-        # Geração da árvore de diretórios (corrigida)
+        # Geração da árvore de diretórios (inclui todos os itens, sem filtro)
         arvore_str = self.gerar_arvore(pasta_origem)
         linhas_markdown.append("\n## 📂 Estrutura Completa de Arquivos\n\n")
         linhas_markdown.append("```text\n")
